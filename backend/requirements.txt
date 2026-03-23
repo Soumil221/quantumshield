@@ -1,0 +1,15 @@
+# Quantum Shield — Python dependencies
+# Install: pip install -r requirements.txt
+
+# ── Web framework ─────────────────────────────────────────────────────────── #
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# ── Data validation ───────────────────────────────────────────────────────── #
+pydantic>=2.7.0
+
+# ── MongoDB driver ────────────────────────────────────────────────────────── #
+pymongo>=4.7.0          # sync driver — used from ThreadPoolExecutor workers
+
+# ── Standard library used (no install needed) ─────────────────────────────── #
+# ssl, socket, subprocess, re, logging, asyncio, concurrent.futures, shutil
