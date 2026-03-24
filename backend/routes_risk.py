@@ -16,9 +16,13 @@ from __future__ import annotations
 import asyncio
 from functools import partial
 from typing import Any
+import importlib
 
+# Dynamically import FastAPI's APIRouter if available. Using importlib
+# avoids static analysis trying to resolve the optional dependency.
 try:
-    from fastapi import APIRouter
+    _fastapi = importlib.import_module("fastapi")
+    APIRouter = getattr(_fastapi, "APIRouter")
 except Exception:  # pragma: no cover - fallback for environments without FastAPI
     class APIRouter:  # type: ignore
         def __init__(self, *args, **kwargs):
