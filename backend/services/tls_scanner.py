@@ -55,6 +55,37 @@ TLS_WORKERS: int = 20
 CONNECT_TIMEOUT: float = 10.0    # seconds per handshake attempt
 
 
+# ── Cryptography library availability check ───────────────────────────────── #
+# We attempt to import once at module load and degrade gracefully if absent.
+
+try:
+    from cryptography import x509 as _x509
+    from cryptography.hazmat.primitives.asymmetric import (
+        rsa as _rsa,
+        ec as _ec,
+        dsa as _dsa,
+        ed25519 as _ed25519,
+        ed448 as _ed448,
+    )
+    _CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    from typing import Any, cast
+
+    _CRYPTOGRAPHY_AVAILABLE = False
+    # Use Any-typed placeholders so static analyzers allow attribute access.
+    _x509: Any = cast(Any, None)
+    _rsa: Any = cast(Any, None)
+    _ec: Any = cast(Any, None)
+    _dsa: Any = cast(Any, None)
+    _ed25519: Any = cast(Any, None)
+    _ed448: Any = cast(Any, None)
+    logger.warning(
+        "[tls] 'cryptography' package not installed — "
+        "certificate signature algorithms will be unavailable. "
+        "Run: pip install cryptography"
+    )
+
+
 # ── Step 1 — Port filtering ───────────────────────────────────────────────── #
 
 def filter_tls_ports(ports: list[int]) -> list[int]:
@@ -130,7 +161,69 @@ def _extract_san(cert_dict: dict) -> list[str]:
     return san_list
 
 
-def parse_certificate(cert_dict: Optional[dict]) -> Optional[CertificateInfo]:
+def _extract_signature_algorithm(cert_der: Optional[bytes]) -> str:
+    """
+    Extract the human-readable signature algorithm from raw DER cert bytes.
+
+    Uses the 'cryptography' library when available to produce strings like:
+        "sha256WithRSAEncryption"
+        "ecdsa-with-SHA256"
+        "ed25519"
+
+    Falls back gracefully with a clear message if the library is absent or
+    parsing fails.
+
+    Args:
+        cert_der: Raw DER-encoded certificate bytes from
+                  ssl.SSLSocket.getpeercert(binary_form=True).
+
+    Returns:
+        A human-readable signature algorithm string, never None.
+    """
+    if not cert_der:
+        return "unavailable (no DER bytes)"
+
+    if not _CRYPTOGRAPHY_AVAILABLE:
+        return "unavailable (install cryptography: pip install cryptography)"
+
+    try:
+        cert_obj = _x509.load_der_x509_certificate(cert_der)
+
+        # Prefer the hash algorithm name combined with the key type —
+        # this mirrors the OpenSSL-style naming convention.
+        hash_algo = cert_obj.signature_hash_algorithm
+        pub_key = cert_obj.public_key()
+
+        if hash_algo is None:
+            # Pure EdDSA algorithms (Ed25519, Ed448) have no separate hash.
+            if isinstance(pub_key, _ed25519.Ed25519PublicKey):
+                return "ed25519"
+            if isinstance(pub_key, _ed448.Ed448PublicKey):
+                return "ed448"
+            # Unknown — fall back to OID dotted string.
+            return cert_obj.signature_algorithm_oid.dotted_string
+
+        hash_name = hash_algo.name.lower()   # e.g. "sha256"
+
+        if isinstance(pub_key, _rsa.RSAPublicKey):
+            return f"sha{hash_name.replace('sha', '')}WithRSAEncryption"
+        if isinstance(pub_key, _ec.EllipticCurvePublicKey):
+            return f"ecdsa-with-{hash_name.upper().replace('SHA', 'SHA')}"
+        if isinstance(pub_key, _dsa.DSAPublicKey):
+            return f"dsa-with-{hash_name.upper()}"
+
+        # Fallback for any other key type — still better than "unavailable".
+        return f"{hash_name}WithUnknownKey"
+
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[tls] Could not extract signature algorithm from DER: %s", exc)
+        return f"unavailable (parse error: {type(exc).__name__})"
+
+
+def parse_certificate(
+    cert_dict: Optional[dict],
+    cert_der: Optional[bytes] = None,
+) -> Optional[CertificateInfo]:
     """
     Convert Python's raw cert dict into a structured CertificateInfo object.
 
@@ -138,12 +231,14 @@ def parse_certificate(cert_dict: Optional[dict]) -> Optional[CertificateInfo]:
         subject, issuer, notBefore, notAfter, serialNumber, version,
         subjectAltName, OCSP, caIssuers, crlDistributionPoints
 
-    Note on signature_algorithm:
-        Python's built-in ssl module does NOT expose the signature algorithm
-        directly in getpeercert(). It requires the 'cryptography' library to
-        extract from DER bytes.  We mark it as "unavailable (stdlib only)" so
-        the field is always present but honest about the limitation.
-        Future upgrade: pass cert_der to cryptography.x509.load_der_x509_certificate()
+    signature_algorithm is extracted from the DER bytes via the 'cryptography'
+    library (e.g. "sha256WithRSAEncryption").  Falls back gracefully if the
+    library is unavailable or cert_der is not provided.
+
+    Args:
+        cert_dict: Decoded certificate dict from ssl.SSLSocket.getpeercert().
+        cert_der:  Raw DER bytes from ssl.SSLSocket.getpeercert(binary_form=True).
+                   Optional but required for signature algorithm extraction.
     """
     if not cert_dict:
         return None
@@ -171,8 +266,7 @@ def parse_certificate(cert_dict: Optional[dict]) -> Optional[CertificateInfo]:
         not_after=_parse_expiry(not_after_raw),
         days_until_expiry=days_left,
         expiry_status=expiry_status,
-        # Python stdlib cannot extract this without the 'cryptography' package
-        signature_algorithm="unavailable (stdlib only — upgrade to cryptography lib for full details)",
+        signature_algorithm=_extract_signature_algorithm(cert_der),
         subject_alt_names=_extract_san(cert_dict),
         version=cert_dict.get("version"),
         ocsp=list(cert_dict.get("OCSP", [])),
@@ -263,7 +357,8 @@ def scan_single(host: str, port: int) -> TLSScanResult | TLSScanFailure:
     # outcome is RawTLSData from here — help static type-checkers with a cast
     outcome = cast(RawTLSData, outcome)
 
-    cert_info = parse_certificate(outcome.cert_dict)
+    # Pass both cert_dict AND cert_der so signature_algorithm can be extracted
+    cert_info = parse_certificate(outcome.cert_dict, outcome.cert_der)
     warnings = _build_warnings(
         outcome.tls_version,
         outcome.cipher_name,
