@@ -12,6 +12,7 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 from functools import partial
+from routes_risk import router as risk_router
 
 try:
     from fastapi import FastAPI, Request, status  # type: ignore
@@ -41,6 +42,15 @@ except Exception:  # pragma: no cover - fallback for environments without FastAP
                 return fn
 
             return decorator
+
+        def include_router(self, router, **kwargs):
+            """No-op include_router for environments without FastAPI.
+
+            The real FastAPI method registers APIRouters; here we provide a
+            compatible signature that does nothing so importing modules that
+            call ``app.include_router(...)`` won't fail in test or linters.
+            """
+            return None
 
     class Request:  # type: ignore
         def __init__(self):
@@ -125,7 +135,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
+app.include_router(risk_router)
 # ── Exception handlers ────────────────────────────────────────────────────── #
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
