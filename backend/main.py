@@ -12,93 +12,42 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 from functools import partial
-from routes_risk import router as risk_router
 
-try:
-    from fastapi import FastAPI, Request, status  # type: ignore
-    from fastapi.exceptions import RequestValidationError  # type: ignore
-    from fastapi.responses import JSONResponse  # type: ignore
-except Exception:  # pragma: no cover - fallback for environments without FastAPI
-    from types import SimpleNamespace
+from fastapi import FastAPI, Request, status  # type: ignore
+from fastapi.exceptions import RequestValidationError  # type: ignore
+from fastapi.responses import JSONResponse  # type: ignore
 
-    class FastAPI:  # type: ignore
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def exception_handler(self, exc_type):
-            def decorator(fn):
-                return fn
-
-            return decorator
-
-        def get(self, path: str, **kwargs):
-            def decorator(fn):
-                return fn
-
-            return decorator
-
-        def post(self, path: str, **kwargs):
-            def decorator(fn):
-                return fn
-
-            return decorator
-
-        def include_router(self, router, **kwargs):
-            """No-op include_router for environments without FastAPI.
-
-            The real FastAPI method registers APIRouters; here we provide a
-            compatible signature that does nothing so importing modules that
-            call ``app.include_router(...)`` won't fail in test or linters.
-            """
-            return None
-
-    class Request:  # type: ignore
-        def __init__(self):
-            self.url = SimpleNamespace(path="")
-
-    class RequestValidationError(Exception):  # type: ignore
-        def __init__(self, *args):
-            super().__init__(*args)
-
-        def errors(self):
-            return []
-
-    class JSONResponse:  # type: ignore
-        def __init__(self, status_code: int, content: dict):
-            self.status_code = status_code
-            self.content = content
-
-    class _Status:  # type: ignore
-        HTTP_200_OK = 200
-        HTTP_422_UNPROCESSABLE_ENTITY = 422
-        HTTP_500_INTERNAL_SERVER_ERROR = 500
-
-    status = _Status()
-
-from db.mongo import init_mongo, close_mongo
+from db.mongo import init_mongo, close_mongo, get_cbom_collection
 from models import (
     CBOMResponse,
     DomainRequest,
     ErrorDetail,
-    HeaderScanResponse,
+    AssetAnalysis,
+    FullAnalysisResponse,
+    RecommendationBatchResponse,
+    RecommendationReportSchema,
+    RecommendationSchema,
+    RiskAnalysisBatchResponse,
+    RiskAnalysisSchema,
+    RiskFindingSchema,
     ScanRequest,
     ScanResponse,
     DiscoverResponse,
     TLSScanResponse,
 )
-from services.scanner import initiate_scan
 from services.asset_discovery import discover_assets
 from services.tls_scanner import scan_tls_assets
 from services.cbom_generator import process_and_store_cbom
-
-# Header scanner / storage may be developed later — provide local fallbacks
-# so importing main.py does not fail in environments without those modules.
-def scan_headers(assets):
-    raise RuntimeError("header_scanner service is not available in this environment")
-
-
-def save_header_results(analyses):
-    raise RuntimeError("header_storage service is not available in this environment")
+from services.recommendation_engine import (
+    RecommendationReport,
+    generate_recommendations,
+    generate_recommendations_batch,
+)
+from services.risk_analyzer import (
+    RiskAnalysisResult,
+    analyze_risk,
+    analyze_risk_batch,
+)
 
 # ── Logging ──────────────────────────────────────────────────────────────── #
 logging.basicConfig(
@@ -135,7 +84,196 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.include_router(risk_router)
+# ---------------------------------------------------------------------------
+# Risk & Recommendation endpoints (previously in routes_risk.py)
+# ---------------------------------------------------------------------------
+
+
+def _risk_result_to_schema(r: RiskAnalysisResult) -> RiskAnalysisSchema:
+    return RiskAnalysisSchema(
+        asset=r.asset,
+        port=r.port,
+        risk_score=r.risk_score,
+        risk_level=r.risk_level,
+        risk_score_display=r.risk_score_display,
+        findings=[
+            RiskFindingSchema(
+                category=f.category,
+                detail=f.detail,
+                score_contribution=f.score_contribution,
+                severity=f.severity,
+            )
+            for f in r.findings
+        ],
+        is_quantum_safe=r.is_quantum_safe,
+        quantum_safe_reason=r.quantum_safe_reason,
+    )
+
+
+def _rec_report_to_schema(rp: RecommendationReport) -> RecommendationReportSchema:
+    return RecommendationReportSchema(
+        asset=rp.asset,
+        port=rp.port,
+        risk_score=rp.risk_score,
+        risk_level=rp.risk_level,
+        is_quantum_safe=rp.is_quantum_safe,
+        recommendations=[
+            RecommendationSchema(
+                priority=rec.priority,
+                category=rec.category,
+                title=rec.title,
+                detail=rec.detail,
+                action=rec.action,
+                reference=rec.reference,
+            )
+            for rec in rp.recommendations
+        ],
+        summary=rp.summary,
+    )
+
+
+def _count_levels(results: list[RiskAnalysisResult]) -> dict[str, int]:
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "safe": 0}
+    for r in results:
+        counts[r.risk_level.lower()] = counts.get(r.risk_level.lower(), 0) + 1
+    return counts
+
+
+def _fetch_cbom_records(domain: str) -> list[dict]:
+    """Fetch all CBOM records whose asset contains the given domain."""
+    col = get_cbom_collection()
+    cursor = col.find(
+        {"asset": {"$regex": domain, "$options": "i"}},
+        {"_id": 0},
+    )
+    return list(cursor)
+
+
+@app.post(
+    "/risk",
+    response_model=RiskAnalysisBatchResponse,
+    responses={400: {"model": ErrorDetail}, 500: {"model": ErrorDetail}},
+    summary="Quantum Risk Analyzer — score all CBOM assets for a domain",
+)
+async def analyze_risk_endpoint(request: DomainRequest):
+    try:
+        records = await _run(_fetch_cbom_records, request.domain)
+    except Exception as exc:
+        return ErrorDetail(status="error", message=f"Database error: {exc}")
+
+    if not records:
+        return ErrorDetail(
+            status="error",
+            message=(
+                f"No CBOM records found for domain '{request.domain}'. "
+                "Run /cbom first to populate the inventory."
+            ),
+        )
+
+    risk_results: list[RiskAnalysisResult] = await _run(analyze_risk_batch, records)
+
+    counts = _count_levels(risk_results)
+
+    return RiskAnalysisBatchResponse(
+        status="success",
+        domain=request.domain,
+        total_assets_analyzed=len(risk_results),
+        critical_count=counts["critical"],
+        high_count=counts["high"],
+        medium_count=counts["medium"],
+        low_count=counts["low"],
+        safe_count=counts["safe"],
+        results=[_risk_result_to_schema(r) for r in risk_results],
+    )
+
+
+@app.post(
+    "/recommend",
+    response_model=RecommendationBatchResponse,
+    responses={400: {"model": ErrorDetail}, 500: {"model": ErrorDetail}},
+    summary="Recommendation Engine — generate remediation advice for a domain",
+)
+async def recommendations_endpoint(request: DomainRequest):
+    try:
+        records = await _run(_fetch_cbom_records, request.domain)
+    except Exception as exc:
+        return ErrorDetail(status="error", message=f"Database error: {exc}")
+
+    if not records:
+        return ErrorDetail(
+            status="error",
+            message=(
+                f"No CBOM records found for domain '{request.domain}'. "
+                "Run /cbom first to populate the inventory."
+            ),
+        )
+
+    risk_results: list[RiskAnalysisResult] = await _run(analyze_risk_batch, records)
+
+    reports = await _run(
+        generate_recommendations_batch, risk_results, records
+    )
+
+    return RecommendationBatchResponse(
+        status="success",
+        domain=request.domain,
+        total_assets=len(reports),
+        reports=[_rec_report_to_schema(rp) for rp in reports],
+    )
+
+
+@app.post(
+    "/analyze",
+    response_model=FullAnalysisResponse,
+    responses={400: {"model": ErrorDetail}, 500: {"model": ErrorDetail}},
+    summary="Full analysis — risk scores + recommendations in a single call",
+)
+async def full_analysis_endpoint(request: DomainRequest):
+    try:
+        records = await _run(_fetch_cbom_records, request.domain)
+    except Exception as exc:
+        return ErrorDetail(status="error", message=f"Database error: {exc}")
+
+    if not records:
+        return ErrorDetail(
+            status="error",
+            message=(
+                f"No CBOM records found for domain '{request.domain}'. "
+                "Run /cbom first to populate the inventory."
+            ),
+        )
+
+    risk_results: list[RiskAnalysisResult] = await _run(analyze_risk_batch, records)
+
+    reports = await _run(
+        generate_recommendations_batch, risk_results, records
+    )
+
+    counts = _count_levels(risk_results)
+    quantum_safe_count = sum(1 for r in risk_results if r.is_quantum_safe)
+
+    analyses = [
+        AssetAnalysis(
+            risk=_risk_result_to_schema(risk),
+            recommendations=_rec_report_to_schema(report),
+        )
+        for risk, report in zip(risk_results, reports)
+    ]
+
+    return FullAnalysisResponse(
+        status="success",
+        domain=request.domain,
+        total_assets=len(analyses),
+        critical_count=counts["critical"],
+        high_count=counts["high"],
+        medium_count=counts["medium"],
+        low_count=counts["low"],
+        safe_count=counts["safe"],
+        quantum_safe_count=quantum_safe_count,
+        analyses=analyses,
+    )
+
+
 # ── Exception handlers ────────────────────────────────────────────────────── #
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
@@ -170,25 +308,11 @@ async def _run(fn, *args):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, partial(fn, *args))
 
-
 # ── Routes ────────────────────────────────────────────────────────────────── #
 
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict[str, str]:
     return {"status": "ok"}
-
-
-# ── Phase 1 ───────────────────────────────────────────────────────────────── #
-@app.post(
-    "/scan",
-    response_model=ScanResponse,
-    tags=["Phase 1 — Scanner"],
-    summary="Acknowledge a domain scan request",
-    responses={422: {"model": ErrorDetail}, 500: {"model": ErrorDetail}},
-)
-async def scan_domain(payload: ScanRequest) -> ScanResponse:
-    logger.info("POST /scan — domain: %s", payload.domain)
-    return initiate_scan(payload.domain)
 
 
 # ── Phase 2 ───────────────────────────────────────────────────────────────── #
@@ -302,74 +426,3 @@ async def generate_cbom(payload: DomainRequest) -> CBOMResponse:
     logger.info("POST /cbom done — %d records stored for %s", len(records), payload.domain)
     return CBOMResponse(status="success", total_records=len(records), records=records)
 
-
-# ── Phase 5 ───────────────────────────────────────────────────────────────── #
-@app.post(
-    "/scan-headers",
-    response_model=HeaderScanResponse,
-    tags=["Phase 5 — Header Scanner"],
-    summary="Discover assets then analyse HTTP security headers",
-    responses={422: {"model": ErrorDetail}, 500: {"model": ErrorDetail}},
-)
-async def scan_headers_endpoint(payload: DomainRequest) -> HeaderScanResponse:
-    """
-    **All-in-one HTTP security header analysis.**
-
-    Pipeline: **Subfinder → DNS → Nmap → HTTP HEAD requests → header grading**.
-
-    Evaluates 10 security headers per host:
-    - `Strict-Transport-Security` — HSTS strength
-    - `Content-Security-Policy` — XSS / injection policy
-    - `X-Frame-Options` — clickjacking protection
-    - `X-Content-Type-Options` — MIME sniffing protection
-    - `Referrer-Policy` — referrer information leakage
-    - `Permissions-Policy` — browser feature access control
-    - `X-XSS-Protection` — legacy XSS auditor setting
-    - `Server` — software version disclosure
-    - `X-Powered-By` — framework disclosure
-    - `Cache-Control` — sensitive content caching
-
-    Each header is graded **present / weak / missing / misconfigured**.
-    Each host receives an overall letter grade (**A+** → **F**).
-    Results are persisted to `header_scan_inventory` in MongoDB.
-
-    ⚠️ Long-running — budget time for asset discovery + HTTP probing.
-    """
-    logger.info("POST /scan-headers — domain: %s", payload.domain)
-
-    # Step 1: Asset discovery
-    assets = await _run(discover_assets, payload.domain)
-    if not assets:
-        logger.warning("POST /scan-headers — no assets found for %s", payload.domain)
-        return HeaderScanResponse(
-            status="success",
-            total_hosts_scanned=0,
-            total_ports_scanned=0,
-            results=[],
-        )
-
-    logger.info("POST /scan-headers — %d assets found, scanning headers …", len(assets))
-
-    # Step 2: Header scanning
-    analyses = await _run(scan_headers, assets)
-
-    # Step 3: Persist to DB (best-effort — don't fail the response if DB is down)
-    if analyses:
-        try:
-            await _run(save_header_results, analyses)
-        except RuntimeError as exc:
-            logger.error("POST /scan-headers — DB persistence failed: %s", exc)
-            # Continue — return results to caller even if DB write failed
-
-    total_ports = sum(len(a.port_results) for a in analyses)
-    logger.info(
-        "POST /scan-headers done — %d hosts, %d port results",
-        len(analyses), total_ports,
-    )
-
-    return HeaderScanResponse(
-        status="success",
-        total_hosts_scanned=len(analyses),
-        total_ports_scanned=total_ports,
-        results=analyses,
-    )
